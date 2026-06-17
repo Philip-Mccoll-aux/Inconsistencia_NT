@@ -1,0 +1,18 @@
+# create virtual enviroment
+
+python -m venv env
+
+# activate virtual enviroment
+
+.\env\Scripts\activate
+
+# install requiremnts
+
+pip install -r requirements.txt
+
+# frezee requiremnts
+
+pip freeze > requirements.txt
+
+GitHub:
+
