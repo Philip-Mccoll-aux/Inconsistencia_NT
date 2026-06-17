@@ -206,36 +206,97 @@ def _similar_comuna(unknown, all_comunas):
     return matches[0] if matches else None
 
 
-def run_pre_revision(ws, header_row, col_map, bd, hallazgos, target_doc):
+def _similar_nombre(nombre, candidatos, by_id_unico_full):
+    """Intenta desempatar múltiples ID UNICO candidatos por similitud de nombre."""
+    if not nombre:
+        return None
+    nombres_cands = {id_u: by_id_unico_full.get(id_u, {}).get("nombre", "") for id_u in candidatos}
+    best_id, best_score = None, 0.0
+    for id_u, nom in nombres_cands.items():
+        if not nom:
+            continue
+        score = difflib.SequenceMatcher(None, nombre.upper(), nom.upper()).ratio()
+        if score > best_score:
+            best_score, best_id = score, id_u
+    return best_id if best_score >= 0.6 else None
+
+
+_ETAPA_MAP = {
+    "PRE_DUPLICIDAD_AGREGACION":             "Agregación",
+    "PRE_HORAS_NORMALIZACION_DISTINTAS":     "Agregación",
+    "PRE_DATOS_INSUFICIENTES_TRIADA":        "ID único",
+    "PRE_ID_UNICO_NO_RESUELTO":              "ID único",
+    "PRE_ID_UNICO_MULTIPLES_CANDIDATOS":     "ID único",
+    "PRE_ID_UNICO_INCONSISTENTE":            "ID único",
+    "PRE_COMUNA_VACIA":                      "Comunas",
+    "PRE_COMUNA_NO_VALIDA":                  "Comunas",
+    "PRE_COMUNA_NO_VALIDA_POSIBLE_SIMIL":    "Comunas",
+    "PRE_MULTIPLES_COMUNAS_EN_CELDA":        "Comunas",
+    "PRE_HORA_DISPONIBILIDAD_BARRA_DISTINTA": "Disponibilidad barra",
+}
+
+_RESUMEN_MAP = {
+    "PRE_DUPLICIDAD_AGREGACION":             "Duplicidad de agregación",
+    "PRE_HORAS_NORMALIZACION_DISTINTAS":     "Horas de normalización distintas",
+    "PRE_DATOS_INSUFICIENTES_TRIADA":        "Triada incompleta",
+    "PRE_ID_UNICO_NO_RESUELTO":              "ID único no resuelto",
+    "PRE_ID_UNICO_MULTIPLES_CANDIDATOS":     "Triada con múltiples candidatos",
+    "PRE_ID_UNICO_INCONSISTENTE":            "ID único inconsistente con triada",
+    "PRE_COMUNA_VACIA":                      "Fila sin comuna",
+    "PRE_COMUNA_NO_VALIDA":                  "Comuna no válida",
+    "PRE_COMUNA_NO_VALIDA_POSIBLE_SIMIL":    "Comuna no válida, posible similitud",
+    "PRE_MULTIPLES_COMUNAS_EN_CELDA":        "Múltiples comunas en celda",
+    "PRE_HORA_DISPONIBILIDAD_BARRA_DISTINTA": "Barra con más de una hora de disponibilidad",
+}
+
+_ACCION_MAP = {
+    "PRE_DUPLICIDAD_AGREGACION":             "Revisar filas duplicadas del mismo alimentador/comuna.",
+    "PRE_HORAS_NORMALIZACION_DISTINTAS":     "Revisar y homologar hora de normalización.",
+    "PRE_DATOS_INSUFICIENTES_TRIADA":        "Completar triada (ID PAÑO / ID BARRA / ID COORDINADO).",
+    "PRE_ID_UNICO_NO_RESUELTO":              "Verificar triada en BD Alimentadores.",
+    "PRE_ID_UNICO_MULTIPLES_CANDIDATOS":     "Revisar nombre de alimentador y coincidencias en BD Alimentadores.",
+    "PRE_ID_UNICO_INCONSISTENTE":            "Corregir CLAVE UNICA o verificar triada.",
+    "PRE_COMUNA_VACIA":                      "Completar o revisar comuna informada.",
+    "PRE_COMUNA_NO_VALIDA":                  "Revisar escritura de comuna.",
+    "PRE_COMUNA_NO_VALIDA_POSIBLE_SIMIL":    "Revisar escritura de comuna.",
+    "PRE_MULTIPLES_COMUNAS_EN_CELDA":        "Separar comunas en filas distintas si corresponde.",
+    "PRE_HORA_DISPONIBILIDAD_BARRA_DISTINTA": "Revisar y homologar hora de disponibilidad de barra.",
+}
+
+
+def run_pre_revision(wb, ws, header_row, col_map, bd, hallazgos, target_doc):
     """
-    Ejecuta pre-revisiones B, C, D, D.1 y E.
-    Escribe 5 columnas REV_PRE_* por fila en BD Consolidado.
+    Pre-revisiones B, C, D, D.1 y E.
+    - Escribe 6 columnas REV_PRE_* resumidas por fila en BD Consolidado.
+    - Crea hoja PRE_REVISION_RESUMEN con un registro por hallazgo único.
     """
     if not target_doc:
         return []
 
-    c_doc    = col_map.get("DOCUMENTO")
-    c_pano   = col_map.get("ID PAÑO")
-    c_barra  = col_map.get("ID BARRA PUNTO DE CONTROL")
-    c_coord  = col_map.get("ID COORDINADO AFECTADO")
-    c_tipo   = col_map.get("TIPO CLIENTE")
-    c_clave  = get_col(col_map, "ID UNICO", "CLAVE UNICA", "CLAVE ALIMENTADOR")
+    c_doc     = col_map.get("DOCUMENTO")
+    c_pano    = col_map.get("ID PAÑO")
+    c_barra   = col_map.get("ID BARRA PUNTO DE CONTROL")
+    c_coord   = col_map.get("ID COORDINADO AFECTADO")
+    c_tipo    = col_map.get("TIPO CLIENTE")
+    c_clave   = get_col(col_map, "ID UNICO", "CLAVE UNICA", "CLAVE ALIMENTADOR")
     c_comunas = col_map.get("Comunas")
-    c_norm   = col_map.get("FECHA Y HORA NORMALIZACIÓN DE CONSUMO")
-    c_disp   = col_map.get("FECHA Y HORA DISPONIBILIDAD DE LA BARRA")
+    c_norm    = col_map.get("FECHA Y HORA NORMALIZACIÓN DE CONSUMO")
+    c_disp    = col_map.get("FECHA Y HORA DISPONIBILIDAD DE LA BARRA")
+    c_nombre  = col_map.get("NOMBRE ALIMENTADOR / CONSUMO")
 
-    # Crear/localizar columnas de pre-revisión
     hr1 = header_row + 1
     cp_clasi  = get_or_create_col(ws, col_map, hr1, "REV_PRE_CLASIFICACION")
-    cp_det    = get_or_create_col(ws, col_map, hr1, "REV_PRE_DETALLE")
+    cp_ids    = get_or_create_col(ws, col_map, hr1, "REV_PRE_ID_HALLAZGOS")
+    cp_resumen = get_or_create_col(ws, col_map, hr1, "REV_PRE_RESUMEN")
     cp_filas  = get_or_create_col(ws, col_map, hr1, "REV_PRE_FILAS_RELACIONADAS")
     cp_triada = get_or_create_col(ws, col_map, hr1, "REV_PRE_TRIADA")
     cp_accion = get_or_create_col(ws, col_map, hr1, "REV_PRE_ACCION_SUGERIDA")
 
-    all_comunas   = bd.get("all_comunas", set())
+    all_comunas    = bd.get("all_comunas", set())
     by_barra_coord = bd.get("by_barra_coord", {})
+    by_id_full     = bd.get("by_id_unico_full", {})
 
-    # Recoger filas revisables del documento objetivo
+    # Recoger filas revisables
     data_rows = []
     for i, row in enumerate(ws.iter_rows(values_only=True)):
         if i <= header_row:
@@ -246,51 +307,54 @@ def run_pre_revision(ws, header_row, col_map, bd, hallazgos, target_doc):
             continue
         data_rows.append((i, row))
 
-    # ── B: duplicidad de agregación y horas de normalización distintas ─────────
-    # Agrupar por (doc, clave_unica, comuna_token)
-    agg_grupos = {}  # key -> list of (row_idx, hora_norm)
+    # findings: list of dicts (one per unique finding)
+    findings = []  # {clasif, unidad, filas, triada, detalle, accion, row_idxs}
+
+    # ── B: duplicidad / horas distintas ───────────────────────────────────────
+    agg_grupos = {}
     for i, row in data_rows:
-        doc   = normalize_id(read_cell(row, c_doc))
-        clave = normalize_id(read_cell(row, c_clave)) if c_clave is not None else ""
+        clave  = normalize_id(read_cell(row, c_clave)) if c_clave is not None else ""
         h_norm = read_cell(row, c_norm) if c_norm is not None else None
-        tokens = split_comunas(read_cell(row, c_comunas)) if c_comunas is not None else {None}
+        tokens = split_comunas(read_cell(row, c_comunas)) if c_comunas is not None else set()
         if not tokens:
             tokens = {None}
         for tok in tokens:
-            key = (doc, clave, tok)
-            agg_grupos.setdefault(key, []).append((i, h_norm))
+            agg_grupos.setdefault((clave, tok), []).append((i, h_norm))
 
-    # Resultados por fila para pre-B
-    pre_b = {}  # row_idx -> list of (clasif, detalle)
-    for (doc, clave, tok), entries in agg_grupos.items():
-        if not clave:
+    for (clave, tok), entries in agg_grupos.items():
+        if not clave or len(entries) <= 1:
             continue
         idxs  = [e[0] for e in entries]
         horas = {e[1] for e in entries if e[1] is not None}
         fila_nums = sorted([x + 1 for x in idxs])
+        if len(horas) > 1:
+            clasif = "PRE_HORAS_NORMALIZACION_DISTINTAS"
+            horas_str = " / ".join(
+                h.strftime("%H:%M") if isinstance(h, datetime) else str(h)
+                for h in sorted(horas, key=str)
+            )
+            det = (f"La combinación {target_doc}+{clave}+{tok} presenta horas de normalización distintas. "
+                   f"Filas involucradas: {fila_nums}. Horas observadas: {horas_str}.")
+        else:
+            clasif = "PRE_DUPLICIDAD_AGREGACION"
+            det = (f"La combinación {target_doc}+{clave}+{tok} aparece en más de una fila. "
+                   f"Filas involucradas: {fila_nums}.")
+        unidad = f"{target_doc} + {clave} + {tok}"
+        findings.append({
+            "clasif": clasif, "unidad": unidad, "filas": fila_nums,
+            "triada": "", "detalle": det,
+            "accion": _ACCION_MAP[clasif], "row_idxs": idxs
+        })
 
-        if len(entries) > 1:
-            clasif = "PRE_HORAS_NORMALIZACION_DISTINTAS" if len(horas) > 1 else "PRE_DUPLICIDAD_AGREGACION"
-            if len(horas) > 1:
-                horas_str = " / ".join(
-                    h.strftime("%H:%M") if isinstance(h, datetime) else str(h)
-                    for h in sorted(horas, key=str)
-                )
-                det = (f"La combinación {doc}+{clave}+{tok} presenta horas de normalización distintas. "
-                       f"Filas involucradas: {fila_nums}. Horas observadas: {horas_str}.")
-            else:
-                det = (f"La combinación {doc}+{clave}+{tok} aparece en más de una fila. "
-                       f"Filas involucradas: {fila_nums}.")
-            for idx in idxs:
-                pre_b.setdefault(idx, []).append((clasif, det, fila_nums))
-
-    # ── C: validación de ID único vs triada ────────────────────────────────────
-    pre_c = {}  # row_idx -> (clasif, detalle, triada_str)
+    # ── C: validación ID único vs triada ──────────────────────────────────────
+    # Consolidar por triada única para no repetir hallazgo por cada fila
+    triada_findings = {}  # triada_key -> finding dict  (para E también)
     for i, row in data_rows:
         pano  = normalize_id(read_cell(row, c_pano))  if c_pano  is not None else ""
         barra = normalize_id(read_cell(row, c_barra)) if c_barra is not None else ""
         coord = normalize_id(read_cell(row, c_coord)) if c_coord is not None else ""
         clave = normalize_id(read_cell(row, c_clave)) if c_clave is not None else ""
+        nombre_fila = str(read_cell(row, c_nombre) or "").strip() if c_nombre is not None else ""
         triada_str = f"{pano}|{barra}|{coord}"
 
         if not barra or not coord:
@@ -298,124 +362,222 @@ def run_pre_revision(ws, header_row, col_map, bd, hallazgos, target_doc):
             if not pano:  faltantes.append("ID PAÑO")
             if not barra: faltantes.append("ID BARRA")
             if not coord: faltantes.append("ID COORDINADO")
-            pre_c[i] = ("PRE_DATOS_INSUFICIENTES_TRIADA",
-                        f"No es posible resolver el ID UNICO porque falta: {' / '.join(faltantes)}.",
-                        triada_str)
+            key = ("PRE_DATOS_INSUFICIENTES_TRIADA", triada_str)
+            if key not in triada_findings:
+                det = f"No es posible resolver el ID UNICO porque falta: {' / '.join(faltantes)}."
+                triada_findings[key] = {
+                    "clasif": "PRE_DATOS_INSUFICIENTES_TRIADA", "unidad": triada_str,
+                    "filas": [], "triada": triada_str, "detalle": det,
+                    "accion": _ACCION_MAP["PRE_DATOS_INSUFICIENTES_TRIADA"], "row_idxs": []
+                }
+            triada_findings[key]["filas"].append(i + 1)
+            triada_findings[key]["row_idxs"].append(i)
             continue
 
         candidatos = by_barra_coord.get((barra, coord), set())
         if not candidatos:
-            pre_c[i] = ("PRE_ID_UNICO_NO_RESUELTO",
-                        f"No fue posible resolver ID UNICO para la triada {triada_str}.",
-                        triada_str)
-        elif len(candidatos) > 1:
-            pre_c[i] = ("PRE_ID_UNICO_MULTIPLES_CANDIDATOS",
-                        f"La triada {triada_str} resuelve más de un ID UNICO en BD Alimentadores. "
-                        f"Revisar por nombre de alimentador.",
-                        triada_str)
-        else:
+            key = ("PRE_ID_UNICO_NO_RESUELTO", triada_str)
+            if key not in triada_findings:
+                det = f"No fue posible resolver ID UNICO para la triada {triada_str}."
+                triada_findings[key] = {
+                    "clasif": "PRE_ID_UNICO_NO_RESUELTO", "unidad": triada_str,
+                    "filas": [], "triada": triada_str, "detalle": det,
+                    "accion": _ACCION_MAP["PRE_ID_UNICO_NO_RESUELTO"], "row_idxs": []
+                }
+            triada_findings[key]["filas"].append(i + 1)
+            triada_findings[key]["row_idxs"].append(i)
+        elif len(candidatos) == 1:
             esperado = next(iter(candidatos))
             if clave and clave != esperado:
-                pre_c[i] = ("PRE_ID_UNICO_INCONSISTENTE",
-                            f"La triada {triada_str} apunta a ID UNICO esperado {esperado}, "
-                            f"pero el borrador informa {clave}.",
-                            triada_str)
+                key = ("PRE_ID_UNICO_INCONSISTENTE", triada_str, clave)
+                if key not in triada_findings:
+                    det = (f"La triada {triada_str} apunta a ID UNICO esperado {esperado}, "
+                           f"pero el borrador informa {clave}.")
+                    triada_findings[key] = {
+                        "clasif": "PRE_ID_UNICO_INCONSISTENTE",
+                        "unidad": f"{triada_str} + {clave}",
+                        "filas": [], "triada": triada_str, "detalle": det,
+                        "accion": _ACCION_MAP["PRE_ID_UNICO_INCONSISTENTE"], "row_idxs": []
+                    }
+                triada_findings[key]["filas"].append(i + 1)
+                triada_findings[key]["row_idxs"].append(i)
+        else:
+            # Múltiples candidatos — intentar desempatar por nombre
+            desempate = _similar_nombre(nombre_fila, candidatos, by_id_full)
+            if desempate and clave and clave != desempate:
+                key = ("PRE_ID_UNICO_INCONSISTENTE", triada_str, clave)
+                if key not in triada_findings:
+                    det = (f"La triada {triada_str} apunta a ID UNICO esperado {desempate} "
+                           f"(desempate por nombre), pero el borrador informa {clave}.")
+                    triada_findings[key] = {
+                        "clasif": "PRE_ID_UNICO_INCONSISTENTE",
+                        "unidad": f"{triada_str} + {clave}",
+                        "filas": [], "triada": triada_str, "detalle": det,
+                        "accion": _ACCION_MAP["PRE_ID_UNICO_INCONSISTENTE"], "row_idxs": []
+                    }
+                triada_findings[key]["filas"].append(i + 1)
+                triada_findings[key]["row_idxs"].append(i)
+            elif not desempate:
+                key = ("PRE_ID_UNICO_MULTIPLES_CANDIDATOS", triada_str)
+                if key not in triada_findings:
+                    det = (f"La triada {triada_str} resuelve más de un ID UNICO en BD Alimentadores. "
+                           f"No fue posible desempatar por nombre de alimentador.")
+                    triada_findings[key] = {
+                        "clasif": "PRE_ID_UNICO_MULTIPLES_CANDIDATOS", "unidad": triada_str,
+                        "filas": [], "triada": triada_str, "detalle": det,
+                        "accion": _ACCION_MAP["PRE_ID_UNICO_MULTIPLES_CANDIDATOS"], "row_idxs": []
+                    }
+                triada_findings[key]["filas"].append(i + 1)
+                triada_findings[key]["row_idxs"].append(i)
 
-    # ── D / D.1: comunas válidas y múltiples comunas en celda ─────────────────
-    pre_d = {}  # row_idx -> list of (clasif, detalle)
+    findings.extend(triada_findings.values())
+
+    # ── D / D.1: comunas válidas ───────────────────────────────────────────────
+    # Agrupar por (clasif, token) para no repetir la misma comuna inválida
+    comuna_findings = {}  # (clasif, tok) -> finding
     for i, row in data_rows:
         raw = read_cell(row, c_comunas) if c_comunas is not None else None
-        findings = []
+        triada_str = (f"{normalize_id(read_cell(row, c_pano)) if c_pano is not None else ''}"
+                      f"|{normalize_id(read_cell(row, c_barra)) if c_barra is not None else ''}"
+                      f"|{normalize_id(read_cell(row, c_coord)) if c_coord is not None else ''}")
         if is_empty(raw):
-            findings.append(("PRE_COMUNA_VACIA", "La fila no informa comuna."))
+            key = ("PRE_COMUNA_VACIA", i)  # per row
+            det = "La fila no informa comuna."
+            findings.append({
+                "clasif": "PRE_COMUNA_VACIA", "unidad": f"Fila {i+1}",
+                "filas": [i + 1], "triada": triada_str, "detalle": det,
+                "accion": _ACCION_MAP["PRE_COMUNA_VACIA"], "row_idxs": [i]
+            })
         else:
             tokens = split_comunas(raw)
             if len(tokens) > 1:
-                findings.append(("PRE_MULTIPLES_COMUNAS_EN_CELDA",
-                                 "La celda contiene más de una comuna. Se deben tratar como "
-                                 "tokens independientes para el análisis, sin modificar el valor original."))
+                key = ("PRE_MULTIPLES_COMUNAS_EN_CELDA", i)
+                det = ("La celda contiene más de una comuna. Se deben tratar como "
+                       "tokens independientes para el análisis, sin modificar el valor original.")
+                findings.append({
+                    "clasif": "PRE_MULTIPLES_COMUNAS_EN_CELDA", "unidad": f"Fila {i+1}",
+                    "filas": [i + 1], "triada": triada_str, "detalle": det,
+                    "accion": _ACCION_MAP["PRE_MULTIPLES_COMUNAS_EN_CELDA"], "row_idxs": [i]
+                })
             for tok in tokens:
                 if tok not in all_comunas:
                     simil = _similar_comuna(tok, all_comunas) if all_comunas else None
                     if simil:
-                        findings.append(("PRE_COMUNA_NO_VALIDA_POSIBLE_SIMIL",
-                                         f"La comuna informada {tok} no existe. Posible coincidencia: {simil}."))
+                        clasif = "PRE_COMUNA_NO_VALIDA_POSIBLE_SIMIL"
+                        det = f"La comuna informada {tok} no existe. Posible coincidencia: {simil}."
                     else:
-                        findings.append(("PRE_COMUNA_NO_VALIDA",
-                                         f"La comuna informada {tok} no existe en el listado general de comunas válidas."))
-        if findings:
-            pre_d[i] = findings
+                        clasif = "PRE_COMUNA_NO_VALIDA"
+                        det = f"La comuna informada {tok} no existe en el listado general de comunas válidas."
+                    c_key = (clasif, tok)
+                    if c_key not in comuna_findings:
+                        comuna_findings[c_key] = {
+                            "clasif": clasif, "unidad": tok,
+                            "filas": [], "triada": "", "detalle": det,
+                            "accion": _ACCION_MAP[clasif], "row_idxs": []
+                        }
+                    comuna_findings[c_key]["filas"].append(i + 1)
+                    comuna_findings[c_key]["row_idxs"].append(i)
+
+    findings.extend(comuna_findings.values())
 
     # ── E: hora única de disponibilidad de barra ───────────────────────────────
-    disp_grupos = {}  # (doc, barra) -> list of (row_idx, hora_disp)
+    disp_grupos = {}
     for i, row in data_rows:
-        doc   = normalize_id(read_cell(row, c_doc))
-        barra = normalize_id(read_cell(row, c_barra)) if c_barra is not None else ""
+        barra  = normalize_id(read_cell(row, c_barra)) if c_barra is not None else ""
         h_disp = read_cell(row, c_disp) if c_disp is not None else None
-        disp_grupos.setdefault((doc, barra), []).append((i, h_disp))
+        disp_grupos.setdefault(barra, []).append((i, h_disp))
 
-    pre_e = {}  # row_idx -> (clasif, detalle)
-    for (doc, barra), entries in disp_grupos.items():
+    for barra, entries in disp_grupos.items():
         horas = {e[1] for e in entries if e[1] is not None}
         if len(horas) > 1:
-            idxs = sorted([e[0] + 1 for e in entries])
-            det  = (f"La barra {barra} presenta más de una hora de disponibilidad en el "
-                    f"documento {doc}. Filas involucradas: {idxs}.")
-            for idx, _ in entries:
-                pre_e[idx] = ("PRE_HORA_DISPONIBILIDAD_BARRA_DISTINTA", det)
+            fila_nums = sorted([e[0] + 1 for e in entries])
+            det = (f"La barra {barra} presenta más de una hora de disponibilidad en el "
+                   f"documento {target_doc}. Filas involucradas: {fila_nums}.")
+            findings.append({
+                "clasif": "PRE_HORA_DISPONIBILIDAD_BARRA_DISTINTA",
+                "unidad": f"{target_doc} + Barra {barra}",
+                "filas": fila_nums, "triada": "—", "detalle": det,
+                "accion": _ACCION_MAP["PRE_HORA_DISPONIBILIDAD_BARRA_DISTINTA"],
+                "row_idxs": [e[0] for e in entries]
+            })
+
+    # ── Asignar IDs correlativos ───────────────────────────────────────────────
+    for n, f in enumerate(findings, 1):
+        f["id"] = f"PRE-{n:03d}"
+
+    # ── Mapa row_idx -> lista de findings que lo afectan ─────────────────────
+    row_to_findings = {}
+    for f in findings:
+        for idx in f["row_idxs"]:
+            row_to_findings.setdefault(idx, []).append(f)
 
     # ── Escribir columnas en BD Consolidado ────────────────────────────────────
     for i, row in data_rows:
-        clasifs, detalles, fila_refs, triadas, acciones = [], [], [], [], []
-
-        for (cl, det, filas_rel) in pre_b.get(i, []):
-            clasifs.append(cl)
-            detalles.append(det)
-            fila_refs.append(str(filas_rel))
-            acciones.append("Revisar duplicidad de filas.")
-
-        if i in pre_c:
-            cl, det, tr = pre_c[i]
-            clasifs.append(cl)
-            detalles.append(det)
-            triadas.append(tr)
-            acciones.append("Verificar triada en BD Alimentadores.")
-
-        for (cl, det) in pre_d.get(i, []):
-            clasifs.append(cl)
-            detalles.append(det)
-            acciones.append("Revisar valor de comuna.")
-
-        if i in pre_e:
-            cl, det = pre_e[i]
-            clasifs.append(cl)
-            detalles.append(det)
-            acciones.append("Revisar hora de disponibilidad de barra.")
-
-        # Triada desde la fila actual si no la tenemos de pre_c
         pano_v  = normalize_id(read_cell(row, c_pano))  if c_pano  is not None else ""
         barra_v = normalize_id(read_cell(row, c_barra)) if c_barra is not None else ""
         coord_v = normalize_id(read_cell(row, c_coord)) if c_coord is not None else ""
         triada_fila = f"{pano_v}|{barra_v}|{coord_v}"
 
-        if clasifs:
-            write_cell(ws, i + 1, cp_clasi,  ";".join(clasifs))
-            write_cell(ws, i + 1, cp_det,    " | ".join(detalles))
-            write_cell(ws, i + 1, cp_filas,  "; ".join(fila_refs) if fila_refs else "")
-            write_cell(ws, i + 1, cp_triada, "; ".join(triadas) if triadas else triada_fila)
-            write_cell(ws, i + 1, cp_accion, "; ".join(dict.fromkeys(acciones)))
+        flist = row_to_findings.get(i, [])
+        if flist:
+            clasifs   = list(dict.fromkeys(f["clasif"]   for f in flist))
+            ids       = list(dict.fromkeys(f["id"]       for f in flist))
+            resumenes = list(dict.fromkeys(_RESUMEN_MAP.get(f["clasif"], f["clasif"]) for f in flist))
+            filas_rel = list(dict.fromkeys(str(f["filas"]) for f in flist if f["filas"]))
+            triadas   = list(dict.fromkeys(f["triada"] for f in flist if f["triada"] and f["triada"] != "—"))
+            acciones  = list(dict.fromkeys(f["accion"] for f in flist))
+
+            write_cell(ws, i + 1, cp_clasi,   "; ".join(clasifs))
+            write_cell(ws, i + 1, cp_ids,     "; ".join(ids))
+            write_cell(ws, i + 1, cp_resumen,  "; ".join(resumenes))
+            write_cell(ws, i + 1, cp_filas,   "; ".join(filas_rel))
+            write_cell(ws, i + 1, cp_triada,  "; ".join(triadas) if triadas else triada_fila)
+            write_cell(ws, i + 1, cp_accion,  "; ".join(acciones))
         else:
             write_cell(ws, i + 1, cp_clasi,  "OK")
             write_cell(ws, i + 1, cp_triada, triada_fila)
 
-        # Agregar hallazgos resumen para el reporte
-        for cl in clasifs:
-            hallazgos.append({
-                "HU": "PRE",
-                "Tipo": cl,
-                "Documento": target_doc,
-                "Detalle": f"Fila {i+1} | {'; '.join(detalles)}"
-            })
+    # ── Crear hoja PRE_REVISION_RESUMEN ───────────────────────────────────────
+    sheet_name = "PRE_REVISION_RESUMEN"
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws_pre = wb.create_sheet(sheet_name)
+
+    hfill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    pre_headers = [
+        "ID_HALLAZGO", "DOCUMENTO", "ETAPA", "CLASIFICACION",
+        "UNIDAD_AFECTADA", "FILAS_RELACIONADAS", "TRIADA",
+        "DETALLE", "ACCION_SUGERIDA", "ESTADO_REVISION"
+    ]
+    col_widths = [12, 18, 22, 38, 42, 30, 22, 80, 60, 16]
+    for c, (h, w) in enumerate(zip(pre_headers, col_widths), 1):
+        cell = ws_pre.cell(row=1, column=c, value=h)
+        cell.fill = hfill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center")
+        ws_pre.column_dimensions[cell.column_letter].width = w
+
+    for rn, f in enumerate(findings, 2):
+        ws_pre.cell(row=rn, column=1, value=f["id"])
+        ws_pre.cell(row=rn, column=2, value=target_doc)
+        ws_pre.cell(row=rn, column=3, value=_ETAPA_MAP.get(f["clasif"], "Otro"))
+        ws_pre.cell(row=rn, column=4, value=f["clasif"])
+        ws_pre.cell(row=rn, column=5, value=f["unidad"])
+        ws_pre.cell(row=rn, column=6, value=", ".join(str(x) for x in f["filas"]))
+        ws_pre.cell(row=rn, column=7, value=f["triada"])
+        c8 = ws_pre.cell(row=rn, column=8, value=f["detalle"])
+        c8.alignment = Alignment(wrap_text=True, vertical="top")
+        ws_pre.cell(row=rn, column=9, value=f["accion"])
+        ws_pre.cell(row=rn, column=10, value="")  # ESTADO_REVISION — vacío para ingeniería
+
+    # ── Hallazgos para el reporte (uno por finding único) ────────────────────
+    for f in findings:
+        hallazgos.append({
+            "HU": "PRE",
+            "Tipo": f["clasif"],
+            "Documento": target_doc,
+            "Detalle": f"{f['id']} | {f['unidad']} | Filas: {f['filas']}"
+        })
 
     return []
 
@@ -1004,7 +1166,7 @@ if run_btn:
 
         # Pre-revisiones siempre primero
         if "PRE" in opts_str:
-            all_errors.extend(run_pre_revision(ws, header_row, col_map, bd, hallazgos, target_doc))
+            all_errors.extend(run_pre_revision(wb, ws, header_row, col_map, bd, hallazgos, target_doc))
 
         if "HU-001" in opts_str:
             all_errors.extend(run_hu001(ws, header_row, col_map, hallazgos))
