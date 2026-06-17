@@ -1,6 +1,7 @@
 import io
 import unicodedata
 import re
+import difflib
 from datetime import datetime
 
 import openpyxl
@@ -123,29 +124,39 @@ def load_bd_alimentadores(file):
     by_punto_ctrl    = {}
     by_id_unico      = {}
     by_id_unico_full = {}
+    by_barra_coord   = {}   # (barra, coord) -> set of id_unico
+    all_comunas      = set()  # universo de comunas válidas
 
     for row in rows[1:]:
         id_unico    = normalize_id(row[col["ID UNICO"]])
         id_pc       = normalize_id(row[col["ID Punto Control"]])
+        id_coord    = normalize_id(row[col["ID COORDINADO"]])
         comunas_raw = str(row[col["Comunas_25F"]] or "").strip()
         nombre      = str(row[col["Nombre Alimentador_25F"]] or "").strip() if "Nombre Alimentador_25F" in col else ""
         barra       = str(row[col["Barra_25F"]]             or "").strip() if "Barra_25F"             in col else ""
         sust        = str(row[col["Subestación"]]           or "").strip() if "Subestación"           in col else ""
 
+        comunas_set = split_comunas(comunas_raw)
+        all_comunas |= comunas_set
+
         by_punto_ctrl.setdefault(id_pc, set()).add(id_unico)
-        by_id_unico[id_unico] = split_comunas(comunas_raw)
+        by_id_unico[id_unico] = comunas_set
         by_id_unico_full[id_unico] = {
             "nombre":      nombre,
             "barra":       barra,
             "subestacion": sust,
-            "comunas_set": split_comunas(comunas_raw),
+            "comunas_set": comunas_set,
         }
+        if id_pc and id_coord:
+            by_barra_coord.setdefault((id_pc, id_coord), set()).add(id_unico)
 
     wb.close()
     return {
         "by_punto_ctrl":    by_punto_ctrl,
         "by_id_unico":      by_id_unico,
         "by_id_unico_full": by_id_unico_full,
+        "by_barra_coord":   by_barra_coord,
+        "all_comunas":      all_comunas,
     }, None
 
 
@@ -172,7 +183,7 @@ def get_fecha_falla(wb, target_doc):
             break
 
     if c_fecha is None:
-        c_fecha = 8  # columna I por defecto
+        c_fecha = 8
 
     fechas = []
     for i, row in enumerate(ws.iter_rows(values_only=True)):
@@ -186,6 +197,227 @@ def get_fecha_falla(wb, target_doc):
             fechas.append(val)
 
     return min(fechas).strftime("%d-%m-%Y") if fechas else ""
+
+
+# ── PRE-REVISIÓN ──────────────────────────────────────────────────────────────
+
+def _similar_comuna(unknown, all_comunas):
+    matches = difflib.get_close_matches(unknown, all_comunas, n=1, cutoff=0.8)
+    return matches[0] if matches else None
+
+
+def run_pre_revision(ws, header_row, col_map, bd, hallazgos, target_doc):
+    """
+    Ejecuta pre-revisiones B, C, D, D.1 y E.
+    Escribe 5 columnas REV_PRE_* por fila en BD Consolidado.
+    """
+    if not target_doc:
+        return []
+
+    c_doc    = col_map.get("DOCUMENTO")
+    c_pano   = col_map.get("ID PAÑO")
+    c_barra  = col_map.get("ID BARRA PUNTO DE CONTROL")
+    c_coord  = col_map.get("ID COORDINADO AFECTADO")
+    c_tipo   = col_map.get("TIPO CLIENTE")
+    c_clave  = get_col(col_map, "ID UNICO", "CLAVE UNICA", "CLAVE ALIMENTADOR")
+    c_comunas = col_map.get("Comunas")
+    c_norm   = col_map.get("FECHA Y HORA NORMALIZACIÓN DE CONSUMO")
+    c_disp   = col_map.get("FECHA Y HORA DISPONIBILIDAD DE LA BARRA")
+
+    # Crear/localizar columnas de pre-revisión
+    hr1 = header_row + 1
+    cp_clasi  = get_or_create_col(ws, col_map, hr1, "REV_PRE_CLASIFICACION")
+    cp_det    = get_or_create_col(ws, col_map, hr1, "REV_PRE_DETALLE")
+    cp_filas  = get_or_create_col(ws, col_map, hr1, "REV_PRE_FILAS_RELACIONADAS")
+    cp_triada = get_or_create_col(ws, col_map, hr1, "REV_PRE_TRIADA")
+    cp_accion = get_or_create_col(ws, col_map, hr1, "REV_PRE_ACCION_SUGERIDA")
+
+    all_comunas   = bd.get("all_comunas", set())
+    by_barra_coord = bd.get("by_barra_coord", {})
+
+    # Recoger filas revisables del documento objetivo
+    data_rows = []
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if i <= header_row:
+            continue
+        if str(read_cell(row, c_doc) or "").strip() != target_doc:
+            continue
+        if c_tipo is not None and not is_revisable(row, c_tipo):
+            continue
+        data_rows.append((i, row))
+
+    # ── B: duplicidad de agregación y horas de normalización distintas ─────────
+    # Agrupar por (doc, clave_unica, comuna_token)
+    agg_grupos = {}  # key -> list of (row_idx, hora_norm)
+    for i, row in data_rows:
+        doc   = normalize_id(read_cell(row, c_doc))
+        clave = normalize_id(read_cell(row, c_clave)) if c_clave is not None else ""
+        h_norm = read_cell(row, c_norm) if c_norm is not None else None
+        tokens = split_comunas(read_cell(row, c_comunas)) if c_comunas is not None else {None}
+        if not tokens:
+            tokens = {None}
+        for tok in tokens:
+            key = (doc, clave, tok)
+            agg_grupos.setdefault(key, []).append((i, h_norm))
+
+    # Resultados por fila para pre-B
+    pre_b = {}  # row_idx -> list of (clasif, detalle)
+    for (doc, clave, tok), entries in agg_grupos.items():
+        if not clave:
+            continue
+        idxs  = [e[0] for e in entries]
+        horas = {e[1] for e in entries if e[1] is not None}
+        fila_nums = sorted([x + 1 for x in idxs])
+
+        if len(entries) > 1:
+            clasif = "PRE_HORAS_NORMALIZACION_DISTINTAS" if len(horas) > 1 else "PRE_DUPLICIDAD_AGREGACION"
+            if len(horas) > 1:
+                horas_str = " / ".join(
+                    h.strftime("%H:%M") if isinstance(h, datetime) else str(h)
+                    for h in sorted(horas, key=str)
+                )
+                det = (f"La combinación {doc}+{clave}+{tok} presenta horas de normalización distintas. "
+                       f"Filas involucradas: {fila_nums}. Horas observadas: {horas_str}.")
+            else:
+                det = (f"La combinación {doc}+{clave}+{tok} aparece en más de una fila. "
+                       f"Filas involucradas: {fila_nums}.")
+            for idx in idxs:
+                pre_b.setdefault(idx, []).append((clasif, det, fila_nums))
+
+    # ── C: validación de ID único vs triada ────────────────────────────────────
+    pre_c = {}  # row_idx -> (clasif, detalle, triada_str)
+    for i, row in data_rows:
+        pano  = normalize_id(read_cell(row, c_pano))  if c_pano  is not None else ""
+        barra = normalize_id(read_cell(row, c_barra)) if c_barra is not None else ""
+        coord = normalize_id(read_cell(row, c_coord)) if c_coord is not None else ""
+        clave = normalize_id(read_cell(row, c_clave)) if c_clave is not None else ""
+        triada_str = f"{pano}|{barra}|{coord}"
+
+        if not barra or not coord:
+            faltantes = []
+            if not pano:  faltantes.append("ID PAÑO")
+            if not barra: faltantes.append("ID BARRA")
+            if not coord: faltantes.append("ID COORDINADO")
+            pre_c[i] = ("PRE_DATOS_INSUFICIENTES_TRIADA",
+                        f"No es posible resolver el ID UNICO porque falta: {' / '.join(faltantes)}.",
+                        triada_str)
+            continue
+
+        candidatos = by_barra_coord.get((barra, coord), set())
+        if not candidatos:
+            pre_c[i] = ("PRE_ID_UNICO_NO_RESUELTO",
+                        f"No fue posible resolver ID UNICO para la triada {triada_str}.",
+                        triada_str)
+        elif len(candidatos) > 1:
+            pre_c[i] = ("PRE_ID_UNICO_MULTIPLES_CANDIDATOS",
+                        f"La triada {triada_str} resuelve más de un ID UNICO en BD Alimentadores. "
+                        f"Revisar por nombre de alimentador.",
+                        triada_str)
+        else:
+            esperado = next(iter(candidatos))
+            if clave and clave != esperado:
+                pre_c[i] = ("PRE_ID_UNICO_INCONSISTENTE",
+                            f"La triada {triada_str} apunta a ID UNICO esperado {esperado}, "
+                            f"pero el borrador informa {clave}.",
+                            triada_str)
+
+    # ── D / D.1: comunas válidas y múltiples comunas en celda ─────────────────
+    pre_d = {}  # row_idx -> list of (clasif, detalle)
+    for i, row in data_rows:
+        raw = read_cell(row, c_comunas) if c_comunas is not None else None
+        findings = []
+        if is_empty(raw):
+            findings.append(("PRE_COMUNA_VACIA", "La fila no informa comuna."))
+        else:
+            tokens = split_comunas(raw)
+            if len(tokens) > 1:
+                findings.append(("PRE_MULTIPLES_COMUNAS_EN_CELDA",
+                                 "La celda contiene más de una comuna. Se deben tratar como "
+                                 "tokens independientes para el análisis, sin modificar el valor original."))
+            for tok in tokens:
+                if tok not in all_comunas:
+                    simil = _similar_comuna(tok, all_comunas) if all_comunas else None
+                    if simil:
+                        findings.append(("PRE_COMUNA_NO_VALIDA_POSIBLE_SIMIL",
+                                         f"La comuna informada {tok} no existe. Posible coincidencia: {simil}."))
+                    else:
+                        findings.append(("PRE_COMUNA_NO_VALIDA",
+                                         f"La comuna informada {tok} no existe en el listado general de comunas válidas."))
+        if findings:
+            pre_d[i] = findings
+
+    # ── E: hora única de disponibilidad de barra ───────────────────────────────
+    disp_grupos = {}  # (doc, barra) -> list of (row_idx, hora_disp)
+    for i, row in data_rows:
+        doc   = normalize_id(read_cell(row, c_doc))
+        barra = normalize_id(read_cell(row, c_barra)) if c_barra is not None else ""
+        h_disp = read_cell(row, c_disp) if c_disp is not None else None
+        disp_grupos.setdefault((doc, barra), []).append((i, h_disp))
+
+    pre_e = {}  # row_idx -> (clasif, detalle)
+    for (doc, barra), entries in disp_grupos.items():
+        horas = {e[1] for e in entries if e[1] is not None}
+        if len(horas) > 1:
+            idxs = sorted([e[0] + 1 for e in entries])
+            det  = (f"La barra {barra} presenta más de una hora de disponibilidad en el "
+                    f"documento {doc}. Filas involucradas: {idxs}.")
+            for idx, _ in entries:
+                pre_e[idx] = ("PRE_HORA_DISPONIBILIDAD_BARRA_DISTINTA", det)
+
+    # ── Escribir columnas en BD Consolidado ────────────────────────────────────
+    for i, row in data_rows:
+        clasifs, detalles, fila_refs, triadas, acciones = [], [], [], [], []
+
+        for (cl, det, filas_rel) in pre_b.get(i, []):
+            clasifs.append(cl)
+            detalles.append(det)
+            fila_refs.append(str(filas_rel))
+            acciones.append("Revisar duplicidad de filas.")
+
+        if i in pre_c:
+            cl, det, tr = pre_c[i]
+            clasifs.append(cl)
+            detalles.append(det)
+            triadas.append(tr)
+            acciones.append("Verificar triada en BD Alimentadores.")
+
+        for (cl, det) in pre_d.get(i, []):
+            clasifs.append(cl)
+            detalles.append(det)
+            acciones.append("Revisar valor de comuna.")
+
+        if i in pre_e:
+            cl, det = pre_e[i]
+            clasifs.append(cl)
+            detalles.append(det)
+            acciones.append("Revisar hora de disponibilidad de barra.")
+
+        # Triada desde la fila actual si no la tenemos de pre_c
+        pano_v  = normalize_id(read_cell(row, c_pano))  if c_pano  is not None else ""
+        barra_v = normalize_id(read_cell(row, c_barra)) if c_barra is not None else ""
+        coord_v = normalize_id(read_cell(row, c_coord)) if c_coord is not None else ""
+        triada_fila = f"{pano_v}|{barra_v}|{coord_v}"
+
+        if clasifs:
+            write_cell(ws, i + 1, cp_clasi,  ";".join(clasifs))
+            write_cell(ws, i + 1, cp_det,    " | ".join(detalles))
+            write_cell(ws, i + 1, cp_filas,  "; ".join(fila_refs) if fila_refs else "")
+            write_cell(ws, i + 1, cp_triada, "; ".join(triadas) if triadas else triada_fila)
+            write_cell(ws, i + 1, cp_accion, "; ".join(dict.fromkeys(acciones)))
+        else:
+            write_cell(ws, i + 1, cp_clasi,  "OK")
+            write_cell(ws, i + 1, cp_triada, triada_fila)
+
+        # Agregar hallazgos resumen para el reporte
+        for cl in clasifs:
+            hallazgos.append({
+                "HU": "PRE",
+                "Tipo": cl,
+                "Documento": target_doc,
+                "Detalle": f"Fila {i+1} | {'; '.join(detalles)}"
+            })
+
+    return []
 
 
 # ── HU-001 ────────────────────────────────────────────────────────────────────
@@ -210,7 +442,6 @@ def run_hu001(ws, header_row, col_map, hallazgos):
     c_u     = col_map["FECHA Y HORA DISPONIBILIDAD DE LA BARRA"]
     c_v     = col_map["FECHA Y HORA NORMALIZACIÓN DE CONSUMO"]
     c_w     = col_map["OBSERVACIONES"]
-    c_x     = col_map["Comunas"]
     c_ao    = col_map["Mecanismo de Recuperación"]
     c_aq    = get_col(col_map,
                       "Comentarios mecanismo de recuperación",
@@ -224,43 +455,13 @@ def run_hu001(ws, header_row, col_map, hallazgos):
 
     c_clasi = get_or_create_col(ws, col_map, header_row + 1, "REV_RECUPERACION_CLASIFICACION")
 
-    triada_vacias, comunas_vacias = [], []
-    multi_disp, multi_norm = {}, {}
     data_rows = []
-
     for i, row in enumerate(ws.iter_rows(values_only=True)):
         if i <= header_row:
             continue
         if str(row[c_doc] or "").strip() != target_doc or not is_revisable(row, c_tipo):
             continue
         data_rows.append((i, row))
-
-    for i, row in data_rows:
-        if is_empty(row[c_pano]) or is_empty(row[c_barra]) or is_empty(row[c_coord]):
-            triada_vacias.append(i + 1)
-        if is_empty(row[c_x]):
-            comunas_vacias.append(i + 1)
-        key_d = (normalize_id(row[c_doc]), normalize_id(row[c_barra]))
-        multi_disp.setdefault(key_d, set()).add(row[c_u])
-        for com in (split_comunas(row[c_x]) or {None}):
-            key_n = (normalize_id(row[c_doc]), normalize_id(row[c_pano]),
-                     normalize_id(row[c_barra]), normalize_id(row[c_coord]), com)
-            multi_norm.setdefault(key_n, set()).add(row[c_v])
-
-    if triada_vacias:
-        hallazgos.append({"HU": "HU-001", "Tipo": "PRE_REVISION", "Documento": target_doc,
-                          "Detalle": f"Triada vacía en filas: {triada_vacias[:20]}{'...' if len(triada_vacias) > 20 else ''}"})
-    if comunas_vacias:
-        hallazgos.append({"HU": "HU-001", "Tipo": "PRE_REVISION", "Documento": target_doc,
-                          "Detalle": f"Comunas vacías en filas: {comunas_vacias[:20]}{'...' if len(comunas_vacias) > 20 else ''}"})
-    for key, vals in multi_disp.items():
-        if len(vals) > 1:
-            hallazgos.append({"HU": "HU-001", "Tipo": "MULTIPLES_FECHAS_DISPONIBILIDAD",
-                              "Documento": target_doc, "Detalle": f"Barra {key[1]}: {len(vals)} fechas distintas."})
-    for key, vals in multi_norm.items():
-        if len(vals) > 1:
-            hallazgos.append({"HU": "HU-001", "Tipo": "MULTIPLES_FECHAS_NORMALIZACION",
-                              "Documento": target_doc, "Detalle": f"Combinación {key[1:]}: {len(vals)} fechas distintas."})
 
     for i, row in data_rows:
         u_val, v_val = row[c_u], row[c_v]
@@ -438,30 +639,39 @@ def run_hu003(ws, header_row, col_map, bd, hallazgos, hu_results):
 # ── HU-004: comentarios CEN ───────────────────────────────────────────────────
 
 def _comentario_mecanismos(filas, col_map):
+    """
+    Lista todos los alimentadores con normalización antes de disponibilidad,
+    luego agrega el texto de solicitud UNA SOLA VEZ al final.
+    """
     c_rec    = col_map.get("REV_RECUPERACION_CLASIFICACION")
     c_nombre = col_map.get("NOMBRE ALIMENTADOR / CONSUMO")
     c_sust   = get_col(col_map, "SUBESTACIÓN", "SUBESTACION")
 
-    combos = set()
+    combos = []
+    seen   = set()
     for _, row in filas:
         if str(read_cell(row, c_rec) or "").strip() == "NORMALIZACION_ANTES_DISPONIBILIDAD_SIN_RESPALDO":
             alim = str(read_cell(row, c_nombre) or "").strip()
             sust = str(read_cell(row, c_sust)   or "").strip()
-            combos.add((alim, sust))
+            key  = (alim, sust)
+            if key not in seen:
+                seen.add(key)
+                combos.append(key)
 
     if not combos:
         return ""
 
-    blocks = []
-    for alim, sust in sorted(combos):
-        blocks.append(
-            f"El alimentador {alim} ({sust}) tiene hora de normalización equivalente previa "
-            f"a la hora de disponibilidad de la barra.\n\n"
-            f"Se solicita detallar el mecanismo de recuperación de estas cargas para este "
-            f"alimentador donde esto se presente, y con el desglose requerido por la SEC, "
-            f"esto es comunal y por zona de tarificación."
-        )
-    return "\n\n".join(blocks)
+    lineas = [
+        f"El alimentador {alim} ({sust}) tiene hora de normalización equivalente previa "
+        f"a la hora de disponibilidad de la barra."
+        for alim, sust in combos
+    ]
+    frase_cierre = (
+        "Se solicita detallar el mecanismo de recuperación de estas cargas para este "
+        "alimentador donde esto se presente, y con el desglose requerido por la SEC, "
+        "esto es comunal y por zona de tarificación."
+    )
+    return "\n\n".join(lineas) + "\n\n" + frase_cierre
 
 
 def _comentario_alimentadores(filas, col_map, hu_results, bd):
@@ -744,11 +954,13 @@ with col2:
 
 hu_opts = st.multiselect(
     "Validaciones a ejecutar",
-    ["HU-001 – Mecanismos de recuperación",
+    ["PRE – Pre-revisiones (B/C/D/E)",
+     "HU-001 – Mecanismos de recuperación",
      "HU-002 – Alimentadores por barra",
      "HU-003 – Comunas por alimentador",
      "HU-004 – Tabla observaciones CEN"],
-    default=["HU-001 – Mecanismos de recuperación",
+    default=["PRE – Pre-revisiones (B/C/D/E)",
+             "HU-001 – Mecanismos de recuperación",
              "HU-002 – Alimentadores por barra",
              "HU-003 – Comunas por alimentador",
              "HU-004 – Tabla observaciones CEN"],
@@ -788,14 +1000,18 @@ if run_btn:
         hu_results = {"alim": {}, "comunas": {}}
         opts_str   = " ".join(hu_opts)
 
+        target_doc = find_target_doc(ws, header_row, col_map["DOCUMENTO"])
+
+        # Pre-revisiones siempre primero
+        if "PRE" in opts_str:
+            all_errors.extend(run_pre_revision(ws, header_row, col_map, bd, hallazgos, target_doc))
+
         if "HU-001" in opts_str:
             all_errors.extend(run_hu001(ws, header_row, col_map, hallazgos))
         if "HU-002" in opts_str:
             all_errors.extend(run_hu002(ws, header_row, col_map, bd, hallazgos, hu_results))
         if "HU-003" in opts_str:
             all_errors.extend(run_hu003(ws, header_row, col_map, bd, hallazgos, hu_results))
-
-        target_doc = find_target_doc(ws, header_row, col_map["DOCUMENTO"])
 
         if "HU-004" in opts_str:
             all_errors.extend(
@@ -828,19 +1044,20 @@ if "results" in st.session_state:
     if target_doc:
         st.info(f"Documento objetivo: **{target_doc}**")
 
-    hu1 = [h for h in hallazgos if h["HU"] == "HU-001"]
-    hu2 = [h for h in hallazgos if h["HU"] == "HU-002"]
-    hu3 = [h for h in hallazgos if h["HU"] == "HU-003"]
-    hu4 = [h for h in hallazgos if h["HU"] == "HU-004"]
+    h_pre = [h for h in hallazgos if h["HU"] == "PRE"]
+    hu1   = [h for h in hallazgos if h["HU"] == "HU-001"]
+    hu2   = [h for h in hallazgos if h["HU"] == "HU-002"]
+    hu3   = [h for h in hallazgos if h["HU"] == "HU-003"]
+    hu4   = [h for h in hallazgos if h["HU"] == "HU-004"]
 
     st.success(
         f"Validación completa — "
-        f"HU-001: {len(hu1)} | HU-002: {len(hu2)} | "
+        f"PRE: {len(h_pre)} | HU-001: {len(hu1)} | HU-002: {len(hu2)} | "
         f"HU-003: {len(hu3)} | HU-004: {len(hu4)} fila(s) generada(s)"
     )
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["HU-001 Mecanismos", "HU-002 Alimentadores",
+    tab0, tab1, tab2, tab3, tab4 = st.tabs(
+        ["PRE Pre-revisiones", "HU-001 Mecanismos", "HU-002 Alimentadores",
          "HU-003 Comunas", "HU-004 Tabla CEN"]
     )
 
@@ -853,10 +1070,11 @@ if "results" in st.session_state:
                 st.dataframe(pd.DataFrame(items)[["Tipo", "Documento", "Detalle"]],
                              use_container_width=True, hide_index=True)
 
-    show_table(tab1, hu1, "HU-001")
-    show_table(tab2, hu2, "HU-002")
-    show_table(tab3, hu3, "HU-003")
-    show_table(tab4, hu4, "HU-004")
+    show_table(tab0, h_pre, "PRE")
+    show_table(tab1, hu1,   "HU-001")
+    show_table(tab2, hu2,   "HU-002")
+    show_table(tab3, hu3,   "HU-003")
+    show_table(tab4, hu4,   "HU-004")
 
     st.download_button(
         label="⬇ Descargar Excel (clasificaciones + ANEXO_OBSERVACIONES)",
