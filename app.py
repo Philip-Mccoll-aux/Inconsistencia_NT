@@ -6,6 +6,7 @@ from datetime import datetime
 
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter, column_index_from_string
 import streamlit as st
 
 HEADER_SEARCH_ROWS = 10
@@ -441,7 +442,6 @@ def run_pre_revision(wb, ws, header_row, col_map, bd, hallazgos, target_doc):
                       f"|{normalize_id(read_cell(row, c_barra)) if c_barra is not None else ''}"
                       f"|{normalize_id(read_cell(row, c_coord)) if c_coord is not None else ''}")
         if is_empty(raw):
-            key = ("PRE_COMUNA_VACIA", i)  # per row
             det = "La fila no informa comuna."
             findings.append({
                 "clasif": "PRE_COMUNA_VACIA", "unidad": f"Fila {i+1}",
@@ -451,7 +451,6 @@ def run_pre_revision(wb, ws, header_row, col_map, bd, hallazgos, target_doc):
         else:
             tokens = split_comunas(raw)
             if len(tokens) > 1:
-                key = ("PRE_MULTIPLES_COMUNAS_EN_CELDA", i)
                 det = ("La celda contiene más de una comuna. Se deben tratar como "
                        "tokens independientes para el análisis, sin modificar el valor original.")
                 findings.append({
@@ -1075,6 +1074,205 @@ def run_hu004(wb, ws, header_row, col_map, bd, hu_results, target_doc, hallazgos
     return []
 
 
+# ── HU-006: marcado de inconsistencias en columnas de respaldo ───────────────
+#
+# Reglas de prioridad (según HU-006):
+#   1. Si la celda ya tiene información -> no se modifica.
+#   2. Celda vacía y sin inconsistencia  -> se escribe "No aplica".
+#   3. Celda vacía y con inconsistencia  -> texto breve + relleno amarillo
+#      SOLO en esa celda (nunca la fila completa).
+#
+# Alcance: último EAF XXX-2026 + TIPO CLIENTE en (RE, LD). Las filas LT y las
+# de otros documentos no se tocan. La hoja ANEXO_OBSERVACIONES no se ve afectada.
+
+HU006_YELLOW = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+HU006_TEXTO_NO_APLICA = "No aplica"
+
+# Nombres de encabezado esperados por columna (se intenta por nombre y, si no
+# existe, se cae a la letra de columna indicada en la HU).
+HU006_NOMBRES_AO = ("Mecanismo de Recuperación", "MECANISMO DE RECUPERACIÓN",
+                    "Mecanismo de recuperación")
+HU006_NOMBRES_AP = ("Comentarios mecanismo de recuperación",
+                    "Comentario mecanismo de recuperación",
+                    "COMENTARIOS MECANISMO DE RECUPERACIÓN")
+HU006_NOMBRES_AQ = ("Comentario Distribuidora sobre Inconsistencia Comunas",
+                    "COMENTARIOS DISTRIBUIDORA SOBRE INCONSISTENCIA DE COMUNAS",
+                    "Comentario Distribuidora Inconsistencia Comunas")
+HU006_NOMBRES_AS = ("Comentario Distribuidora Inconsistencia Alimentadores",
+                    "COMENTARIO DISTRIBUIDORA SOBRE ALIMENTADORES",
+                    "Comentario Distribuidora sobre Inconsistencia Alimentadores")
+
+HU006_TXT_RECUPERACION = {
+    "NORMALIZACION_ANTES_DISPONIBILIDAD_SIN_RESPALDO":
+        "Normalización de consumo previa a la disponibilidad de la barra, "
+        "sin mecanismo de recuperación informado.",
+    "NORMALIZACION_ANTES_DISPONIBILIDAD_CON_RESPALDO":
+        "Normalización de consumo previa a la disponibilidad de la barra. "
+        "Falta detallar el mecanismo de recuperación en esta columna.",
+    "DATOS_INSUFICIENTES_FECHAS":
+        "Datos insuficientes para validar mecanismo de recuperación.",
+}
+
+HU006_TXT_COMUNAS = {
+    "SOBRAN_COMUNAS":
+        "Se detectan comunas informadas en exceso respecto de BD Alimentadores.",
+    "FALTAN_COMUNAS":
+        "Se detectan comunas faltantes respecto de BD Alimentadores.",
+    "FALTAN_Y_SOBRAN_COMUNAS":
+        "Se detectan comunas faltantes y comunas informadas en exceso respecto "
+        "de BD Alimentadores.",
+    "ID_NO_EN_BASE":
+        "No es posible validar comunas: ID no existe en BD Alimentadores.",
+    "DATOS_INSUFICIENTES":
+        "No es posible validar comunas por datos insuficientes.",
+}
+
+HU006_TXT_ALIMENTADORES = {
+    "SOBRAN_ALIMENTADORES":
+        "Se detectan alimentadores informados en exceso respecto de BD Alimentadores.",
+    "FALTAN_ALIMENTADORES":
+        "Se detectan alimentadores faltantes respecto de BD Alimentadores.",
+    "FALTAN_Y_SOBRAN_ALIMENTADORES":
+        "Se detectan alimentadores faltantes y alimentadores informados en exceso "
+        "respecto de BD Alimentadores.",
+    "BARRA_NO_EN_BASE":
+        "No es posible validar alimentadores: barra no existe en BD Alimentadores.",
+    "DATOS_INSUFICIENTES":
+        "No es posible validar alimentadores por datos insuficientes.",
+}
+
+
+def _hu006_resolver_col(col_map, letra, nombres):
+    """Devuelve (idx_0based, origen, encabezado_actual) para una columna de respaldo."""
+    for n in nombres:
+        if n in col_map:
+            return col_map[n], "nombre", n
+    return column_index_from_string(letra) - 1, "letra", ""
+
+
+def _hu006_marcar(ws, row_num, col_idx, texto):
+    """
+    Aplica la regla de prioridad sobre una celda de respaldo.
+    Retorna: "existente" | "no_aplica" | "marcada"
+    """
+    if col_idx is None:
+        return "existente"
+    cell = ws.cell(row=row_num, column=col_idx + 1)
+    if not is_empty(cell.value):
+        return "existente"          # 1. no se sobrescribe nada ya ingresado
+    if texto is None:
+        cell.value = HU006_TEXTO_NO_APLICA   # 2. sin inconsistencia
+        return "no_aplica"
+    cell.value = texto                        # 3. con inconsistencia
+    cell.fill = HU006_YELLOW
+    cell.alignment = Alignment(wrap_text=True, vertical="top")
+    return "marcada"
+
+
+def run_hu006(ws, header_row, col_map, target_doc, hallazgos,
+              modo_ao_ap="Ambas", cols_detectadas=None):
+    """
+    Completa y marca en amarillo las columnas de respaldo AO/AP (mecanismos),
+    AQ (comunas) y AS (alimentadores) según las clasificaciones de HU-001/002/003.
+    """
+    errores = []
+
+    if not target_doc:
+        hallazgos.append({"HU": "HU-006", "Tipo": "SIN_DOCUMENTO_OBJETIVO",
+                          "Documento": "-", "Detalle": "No se encontró documento EAF XXX-2026."})
+        return errores
+
+    c_doc  = col_map.get("DOCUMENTO")
+    c_tipo = col_map.get("TIPO CLIENTE")
+    if c_doc is None or c_tipo is None:
+        return ["[HU-006] Faltan columnas: DOCUMENTO y/o TIPO CLIENTE."]
+
+    c_rec  = col_map.get("REV_RECUPERACION_CLASIFICACION")
+    c_com  = col_map.get("REV_COMUNAS_CLASIFICACION")
+    c_alim = col_map.get("REV_ALIMENTADORES_CLASIFICACION")
+
+    if c_rec is None and c_com is None and c_alim is None:
+        return ["[HU-006] Ejecute primero HU-001/HU-002/HU-003: no hay columnas "
+                "REV_*_CLASIFICACION disponibles."]
+    if c_rec is None:
+        errores.append("[HU-006] Sin REV_RECUPERACION_CLASIFICACION: se omite el eje AO/AP.")
+    if c_com is None:
+        errores.append("[HU-006] Sin REV_COMUNAS_CLASIFICACION: se omite el eje AQ.")
+    if c_alim is None:
+        errores.append("[HU-006] Sin REV_ALIMENTADORES_CLASIFICACION: se omite el eje AS.")
+
+    # Resolución de columnas de respaldo
+    i_ao, o_ao, n_ao = _hu006_resolver_col(col_map, "AO", HU006_NOMBRES_AO)
+    i_ap, o_ap, n_ap = _hu006_resolver_col(col_map, "AP", HU006_NOMBRES_AP)
+    i_aq, o_aq, n_aq = _hu006_resolver_col(col_map, "AQ", HU006_NOMBRES_AQ)
+    i_as, o_as, n_as = _hu006_resolver_col(col_map, "AS", HU006_NOMBRES_AS)
+
+    if modo_ao_ap == "AO":
+        cols_mec = [i_ao]
+    elif modo_ao_ap == "AP":
+        cols_mec = [i_ap]
+    else:
+        cols_mec = [i_ao, i_ap]
+
+    if cols_detectadas is not None:
+        cols_detectadas.update({
+            "Mecanismos (AO)":    {"letra": get_column_letter(i_ao + 1), "origen": o_ao,
+                                   "encabezado": n_ao, "usada": i_ao in cols_mec},
+            "Mecanismos (AP)":    {"letra": get_column_letter(i_ap + 1), "origen": o_ap,
+                                   "encabezado": n_ap, "usada": i_ap in cols_mec},
+            "Comunas (AQ)":       {"letra": get_column_letter(i_aq + 1), "origen": o_aq,
+                                   "encabezado": n_aq, "usada": c_com is not None},
+            "Alimentadores (AS)": {"letra": get_column_letter(i_as + 1), "origen": o_as,
+                                   "encabezado": n_as, "usada": c_alim is not None},
+        })
+
+    ejes = []
+    if c_rec is not None:
+        for idx in cols_mec:
+            ejes.append(("Mecanismos de recuperación", c_rec, idx, HU006_TXT_RECUPERACION))
+    if c_com is not None:
+        ejes.append(("Comunas", c_com, i_aq, HU006_TXT_COMUNAS))
+    if c_alim is not None:
+        ejes.append(("Alimentadores", c_alim, i_as, HU006_TXT_ALIMENTADORES))
+
+    n_marcadas = n_no_aplica = n_respetadas = 0
+
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if i <= header_row:
+            continue
+        if str(read_cell(row, c_doc) or "").strip() != target_doc:
+            continue
+        if not is_revisable(row, c_tipo):      # excluye LT y cualquier otro tipo
+            continue
+
+        row_num = i + 1
+        for eje, c_clasi, col_idx, textos in ejes:
+            clasi = str(read_cell(row, c_clasi) or "").strip()
+            texto = textos.get(clasi)          # None => OK, vacío o no clasificado
+            resultado = _hu006_marcar(ws, row_num, col_idx, texto)
+
+            if resultado == "marcada":
+                n_marcadas += 1
+                hallazgos.append({
+                    "HU": "HU-006", "Tipo": clasi, "Documento": target_doc,
+                    "Detalle": (f"Fila {row_num} | Columna "
+                                f"{get_column_letter(col_idx + 1)} ({eje}) marcada en amarillo | {texto}")
+                })
+            elif resultado == "no_aplica":
+                n_no_aplica += 1
+            else:
+                n_respetadas += 1
+
+    if cols_detectadas is not None:
+        cols_detectadas["_conteo"] = {
+            "marcadas": n_marcadas,
+            "no_aplica": n_no_aplica,
+            "respetadas": n_respetadas,
+        }
+
+    return errores
+
+
 # ── reporte ───────────────────────────────────────────────────────────────────
 
 def build_report(wb, hallazgos, target_doc):
@@ -1120,13 +1318,25 @@ hu_opts = st.multiselect(
      "HU-001 – Mecanismos de recuperación",
      "HU-002 – Alimentadores por barra",
      "HU-003 – Comunas por alimentador",
-     "HU-004 – Tabla observaciones CEN"],
+     "HU-004 – Tabla observaciones CEN",
+     "HU-006 – Marcado columnas de respaldo (AO/AP/AQ/AS)"],
     default=["PRE – Pre-revisiones (B/C/D/E)",
              "HU-001 – Mecanismos de recuperación",
              "HU-002 – Alimentadores por barra",
              "HU-003 – Comunas por alimentador",
-             "HU-004 – Tabla observaciones CEN"],
+             "HU-004 – Tabla observaciones CEN",
+             "HU-006 – Marcado columnas de respaldo (AO/AP/AQ/AS)"],
 )
+
+modo_label = st.radio(
+    "HU-006 · Columna a completar en el eje *Mecanismos de recuperación*",
+    ["Ambas (AO y AP)", "Solo AO", "Solo AP"],
+    index=0, horizontal=True,
+    help="Punto pendiente de la HU-006: definir si el respaldo se marca sobre el "
+         "mecanismo informado (AO), sobre el comentario asociado (AP) o sobre ambos.",
+)
+MODO_MAP = {"Ambas (AO y AP)": "Ambas", "Solo AO": "AO", "Solo AP": "AP"}
+modo_ao_ap = MODO_MAP[modo_label]
 
 btn_col1, btn_col2 = st.columns([1, 6])
 with btn_col1:
@@ -1160,6 +1370,7 @@ if run_btn:
         hallazgos  = []
         all_errors = []
         hu_results = {"alim": {}, "comunas": {}}
+        cols_hu006 = {}
         opts_str   = " ".join(hu_opts)
 
         target_doc = find_target_doc(ws, header_row, col_map["DOCUMENTO"])
@@ -1180,6 +1391,14 @@ if run_btn:
                 run_hu004(wb, ws, header_row, col_map, bd, hu_results, target_doc, hallazgos)
             )
 
+        # HU-006 al final: consume las clasificaciones ya escritas y no altera
+        # la hoja ANEXO_OBSERVACIONES generada por HU-004.
+        if "HU-006" in opts_str:
+            all_errors.extend(
+                run_hu006(ws, header_row, col_map, target_doc, hallazgos,
+                          modo_ao_ap, cols_hu006)
+            )
+
         build_report(wb, hallazgos, target_doc)
 
         buf = io.BytesIO()
@@ -1190,6 +1409,7 @@ if run_btn:
         "hallazgos":  hallazgos,
         "all_errors": all_errors,
         "target_doc": target_doc,
+        "cols_hu006": cols_hu006,
         "buf":        buf.getvalue(),
     }
 
@@ -1198,6 +1418,7 @@ if "results" in st.session_state:
     hallazgos  = res["hallazgos"]
     all_errors = res["all_errors"]
     target_doc = res["target_doc"]
+    cols_hu006 = res.get("cols_hu006", {})
     buf_bytes  = res["buf"]
 
     for e in all_errors:
@@ -1211,16 +1432,42 @@ if "results" in st.session_state:
     hu2   = [h for h in hallazgos if h["HU"] == "HU-002"]
     hu3   = [h for h in hallazgos if h["HU"] == "HU-003"]
     hu4   = [h for h in hallazgos if h["HU"] == "HU-004"]
+    hu6   = [h for h in hallazgos if h["HU"] == "HU-006"]
 
     st.success(
         f"Validación completa — "
         f"PRE: {len(h_pre)} | HU-001: {len(hu1)} | HU-002: {len(hu2)} | "
-        f"HU-003: {len(hu3)} | HU-004: {len(hu4)} fila(s) generada(s)"
+        f"HU-003: {len(hu3)} | HU-004: {len(hu4)} fila(s) generada(s) | "
+        f"HU-006: {len(hu6)} celda(s) marcada(s)"
     )
 
-    tab0, tab1, tab2, tab3, tab4 = st.tabs(
+    if cols_hu006:
+        conteo = cols_hu006.get("_conteo", {})
+        with st.expander("HU-006 · Columnas de respaldo detectadas y conteo", expanded=False):
+            import pandas as pd
+            filas_cols = [
+                {"Eje": k,
+                 "Columna": v["letra"],
+                 "Resuelta por": v["origen"],
+                 "Encabezado": v["encabezado"] or "(sin nombre coincidente)",
+                 "Se completó": "Sí" if v["usada"] else "No"}
+                for k, v in cols_hu006.items() if k != "_conteo"
+            ]
+            st.dataframe(pd.DataFrame(filas_cols), use_container_width=True, hide_index=True)
+            if conteo:
+                st.caption(
+                    f"Celdas marcadas en amarillo: {conteo.get('marcadas', 0)} · "
+                    f"Celdas completadas con «No aplica»: {conteo.get('no_aplica', 0)} · "
+                    f"Celdas con información previa respetadas: {conteo.get('respetadas', 0)}"
+                )
+            st.caption(
+                "Si alguna columna quedó resuelta «por letra», verifica que corresponda "
+                "al encabezado esperado en tu planilla."
+            )
+
+    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["PRE Pre-revisiones", "HU-001 Mecanismos", "HU-002 Alimentadores",
-         "HU-003 Comunas", "HU-004 Tabla CEN"]
+         "HU-003 Comunas", "HU-004 Tabla CEN", "HU-006 Marcado celdas"]
     )
 
     def show_table(tab, items, label):
@@ -1237,9 +1484,10 @@ if "results" in st.session_state:
     show_table(tab2, hu2,   "HU-002")
     show_table(tab3, hu3,   "HU-003")
     show_table(tab4, hu4,   "HU-004")
+    show_table(tab5, hu6,   "HU-006")
 
     st.download_button(
-        label="⬇ Descargar Excel (clasificaciones + ANEXO_OBSERVACIONES)",
+        label="⬇ Descargar Excel (clasificaciones + ANEXO_OBSERVACIONES + marcado HU-006)",
         data=buf_bytes,
         file_name="EAF_validado.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
